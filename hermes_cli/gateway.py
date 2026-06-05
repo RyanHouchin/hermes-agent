@@ -7,6 +7,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 import asyncio
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -126,27 +127,10 @@ def _get_service_pids() -> set:
 
     # --- launchd (macOS) ---
     if is_macos():
-        try:
-            label = get_launchd_label()
-            result = subprocess.run(
-                ["launchctl", "list", label],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode == 0:
-                # Output: "PID\tStatus\tLabel" header, then one data line
-                for line in result.stdout.strip().splitlines():
-                    parts = line.split()
-                    if len(parts) >= 3 and parts[2] == label:
-                        try:
-                            pid = int(parts[0])
-                            if pid > 0:
-                                pids.add(pid)
-                        except ValueError:
-                            pass
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+        for label in _launchd_gateway_labels():
+            pid = _launchd_pid_for_label(label)
+            if pid is not None:
+                pids.add(pid)
 
     return pids
 
@@ -2094,6 +2078,178 @@ def get_launchd_plist_path() -> Path:
     return _launchd_user_home() / "Library" / "LaunchAgents" / f"{name}.plist"
 
 
+def _is_gateway_launchd_label(label: str) -> bool:
+    if label == "ai.hermes.gateway":
+        return True
+    if label == "ai.hermes.gateway.watchdog":
+        return False
+    return label.startswith("ai.hermes.gateway-")
+
+
+def _launchd_gateway_plists() -> list[Path]:
+    agents_dir = _launchd_user_home() / "Library" / "LaunchAgents"
+    if not agents_dir.exists():
+        return []
+    return sorted(
+        plist
+        for plist in agents_dir.glob("ai.hermes.gateway*.plist")
+        if _is_gateway_launchd_label(plist.stem)
+    )
+
+
+def _launchd_gateway_labels_from_list() -> list[str]:
+    try:
+        result = subprocess.run(
+            ["launchctl", "list"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    labels: list[str] = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and _is_gateway_launchd_label(parts[2]):
+            labels.append(parts[2])
+    return sorted(dict.fromkeys(labels))
+
+
+def _launchd_gateway_labels() -> list[str]:
+    labels = [plist.stem for plist in _launchd_gateway_plists()]
+    labels.extend(_launchd_gateway_labels_from_list())
+    return sorted(dict.fromkeys(labels))
+
+
+def _launchd_target(label: str) -> str:
+    return f"{_launchd_domain()}/{label}"
+
+
+def _launchd_label_loaded(label: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", _launchd_target(label)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def _launchd_pid_for_label(label: str) -> int | None:
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", _launchd_target(label)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    match = re.search(r"^\s*pid = ([1-9][0-9]*)\s*$", result.stdout, re.MULTILINE)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _launchd_label_running(label: str) -> bool:
+    return _launchd_pid_for_label(label) is not None
+
+
+def _launchd_bootstrap_label(plist_path: Path) -> None:
+    label = plist_path.stem
+    result = subprocess.run(
+        ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode == 0 or _launchd_label_loaded(label):
+        return
+    raise subprocess.CalledProcessError(
+        result.returncode,
+        result.args,
+        output=result.stdout,
+        stderr=result.stderr,
+    )
+
+
+def _launchd_kickstart_label(label: str, *, force: bool = False) -> None:
+    cmd = ["launchctl", "kickstart"]
+    if force:
+        cmd.append("-k")
+    cmd.append(_launchd_target(label))
+    subprocess.run(cmd, check=True, timeout=90)
+
+
+def _launchd_start_label(plist_path: Path, *, restart: bool = False) -> bool:
+    label = plist_path.stem
+    if not _launchd_label_loaded(label):
+        _launchd_bootstrap_label(plist_path)
+    if restart or not _launchd_label_running(label):
+        _launchd_kickstart_label(label, force=restart)
+        return True
+    return False
+
+
+def _launchd_stop_label(label: str) -> bool:
+    if not _launchd_label_loaded(label):
+        return False
+    result = subprocess.run(
+        ["launchctl", "bootout", _launchd_target(label)],
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    if result.returncode == 0 or not _launchd_label_loaded(label):
+        return True
+    if result.returncode in {3, 37, 113}:
+        return False
+    raise subprocess.CalledProcessError(
+        result.returncode,
+        result.args,
+        output=result.stdout,
+        stderr=result.stderr,
+    )
+
+
+def _launchd_start_all() -> int:
+    started = 0
+    for plist in _launchd_gateway_plists():
+        if _launchd_start_label(plist, restart=False):
+            started += 1
+    print(f"✓ Started/verified {len(_launchd_gateway_plists())} launchd gateway service(s)")
+    return started
+
+
+def _launchd_stop_all() -> int:
+    labels = _launchd_gateway_labels()
+    stopped = 0
+    for label in labels:
+        if _launchd_stop_label(label):
+            stopped += 1
+    print(f"✓ Stopped {stopped} launchd gateway service(s)")
+    return stopped
+
+
+def _launchd_restart_all() -> int:
+    restarted = 0
+    for plist in _launchd_gateway_plists():
+        if _launchd_start_label(plist, restart=True):
+            restarted += 1
+    print(f"✓ Restarted {restarted} launchd gateway service(s)")
+    return restarted
+
+
 def _detect_venv_dir() -> Path | None:
     """Detect the active virtualenv directory.
 
@@ -3216,7 +3372,7 @@ def launchd_start():
             timeout=30,
         )
     except subprocess.CalledProcessError as e:
-        if e.returncode not in {3, 113}:
+        if e.returncode not in {3, 37, 113}:
             raise
         print("↻ launchd job was unloaded; reloading service definition")
         subprocess.run(
@@ -3250,7 +3406,7 @@ def launchd_stop():
     try:
         subprocess.run(["launchctl", "bootout", target], check=True, timeout=90)
     except subprocess.CalledProcessError as e:
-        if e.returncode in {3, 113}:
+        if e.returncode in {3, 37, 113}:
             pass  # Already unloaded — nothing to stop.
         else:
             raise
@@ -3335,7 +3491,7 @@ def launchd_restart():
         subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
         print("✓ Service restarted")
     except subprocess.CalledProcessError as e:
-        if e.returncode not in {3, 113}:
+        if e.returncode not in {3, 37, 113}:
             raise
         # Job not loaded — bootstrap and start fresh
         print("↻ launchd job was unloaded; reloading")
@@ -6087,6 +6243,10 @@ def _gateway_command_inner(args):
         if not start_all and _dispatch_via_service_manager_if_s6("start"):
             return
 
+        if start_all and is_macos() and _launchd_gateway_plists():
+            _launchd_start_all()
+            return
+
         if start_all:
             # Kill all stale gateway processes across all profiles before starting
             killed = kill_gateway_processes(all_profiles=True)
@@ -6167,6 +6327,13 @@ def _gateway_command_inner(args):
         if stop_all and _dispatch_all_via_service_manager_if_s6("stop"):
             return
         if not stop_all and _dispatch_via_service_manager_if_s6("stop"):
+            return
+
+        if stop_all and is_macos() and _launchd_gateway_labels():
+            _launchd_stop_all()
+            killed = kill_gateway_processes(all_profiles=True)
+            if killed:
+                print(f"✓ Stopped {killed} remaining gateway process(es)")
             return
 
         if stop_all:
@@ -6264,6 +6431,10 @@ def _gateway_command_inner(args):
         if restart_all and _dispatch_all_via_service_manager_if_s6("restart"):
             return
         if not restart_all and _dispatch_via_service_manager_if_s6("restart"):
+            return
+
+        if restart_all and is_macos() and _launchd_gateway_plists():
+            _launchd_restart_all()
             return
 
         if restart_all:
